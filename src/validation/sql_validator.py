@@ -4,11 +4,14 @@ import re
 import sqlparse
 from sqlparse.sql import Token, TokenList
 from sqlparse.tokens import Keyword, DML
-from typing import Tuple, List, Optional
+from typing import Tuple, List, Optional, Set
 from .rules import (
+    DDL_FORBIDDEN_KEYWORDS,
+    DML_WRITE_KEYWORDS,
     FORBIDDEN_KEYWORDS,
     FORBIDDEN_FUNCTIONS,
     ALLOWED_KEYWORDS,
+    WRITE_ALLOWED_KEYWORDS,
     MAX_JOINS,
     MAX_SUBQUERIES,
     MAX_UNIONS,
@@ -25,15 +28,35 @@ class ValidationError(Exception):
 class SQLValidator:
     """SQL sorgu güvenlik validatörü"""
     
-    def __init__(self, strict_mode: bool = True):
+    def __init__(
+        self,
+        strict_mode: bool = True,
+        allowed_operations: Optional[Set[str]] = None,
+        writable_tables: Optional[Set[str]] = None,
+    ):
         """
         SQL validator'ı başlat
         
         Args:
             strict_mode: True ise daha katı kontroller uygula
+            allowed_operations: İzin verilen SQL işlem tipleri.
+                None veya {"SELECT"} → sadece SELECT
+                {"SELECT", "INSERT", "UPDATE", "DELETE"} → okuma + yazma
+            writable_tables: Yazma izni verilen tablo isimleri (None = tümü izinli)
         """
         self.strict_mode = strict_mode
-        logger.info("SQLValidator initialized", strict_mode=strict_mode)
+        self.allowed_operations = allowed_operations or {"SELECT"}
+        self.writable_tables = writable_tables
+        
+        # Yazma modu aktif mi?
+        self.write_enabled = bool(self.allowed_operations - {"SELECT"})
+        
+        logger.debug(
+            "SQLValidator initialized",
+            strict_mode=strict_mode,
+            allowed_operations=list(self.allowed_operations),
+            write_enabled=self.write_enabled,
+        )
     
     def validate(self, sql: str) -> Tuple[bool, Optional[str]]:
         """
@@ -48,9 +71,13 @@ class SQLValidator:
         try:
             # Temel kontroller
             self._check_length(sql)
-            self._check_forbidden_keywords(sql)
+            self._check_ddl_forbidden(sql)
             self._check_forbidden_functions(sql)
-            self._check_only_select(sql)
+            self._check_allowed_operations(sql)
+            
+            # Yazma işlemlerinde ek güvenlik kontrolleri
+            if self._is_write_query(sql):
+                self._check_write_safety(sql)
             
             # Karmaşıklık kontrolleri
             if self.strict_mode:
@@ -76,18 +103,27 @@ class SQLValidator:
                 f"Sorgu çok uzun. Maksimum {MAX_QUERY_LENGTH} karakter olmalı."
             )
     
-    def _check_forbidden_keywords(self, sql: str):
-        """Yasaklı anahtar kelimeleri kontrol et"""
+    def _check_ddl_forbidden(self, sql: str):
+        """DDL ve tehlikeli komutları kontrol et (her zaman engellenir)"""
         sql_upper = sql.upper()
         
-        for keyword in FORBIDDEN_KEYWORDS:
-            # Kelime sınırlarını kontrol et (örn: "SELECT" != "SELECTED")
+        for keyword in DDL_FORBIDDEN_KEYWORDS:
             pattern = r'\b' + re.escape(keyword) + r'\b'
             if re.search(pattern, sql_upper):
                 raise ValidationError(
                     f"Yasaklı komut tespit edildi: {keyword}. "
-                    f"Sadece SELECT sorguları çalıştırılabilir."
+                    f"Bu komut güvenlik nedeniyle her zaman engellenmiştir."
                 )
+        
+        # Yazma modu kapalıysa DML write komutlarını da engelle
+        if not self.write_enabled:
+            for keyword in DML_WRITE_KEYWORDS:
+                pattern = r'\b' + re.escape(keyword) + r'\b'
+                if re.search(pattern, sql_upper):
+                    raise ValidationError(
+                        f"Yasaklı komut tespit edildi: {keyword}. "
+                        f"Sadece SELECT sorguları çalıştırılabilir."
+                    )
     
     def _check_forbidden_functions(self, sql: str):
         """Tehlikeli fonksiyonları kontrol et"""
@@ -100,15 +136,27 @@ class SQLValidator:
                     f"Bu fonksiyon güvenlik nedeniyle yasaklanmıştır."
                 )
     
-    def _check_only_select(self, sql: str):
-        """Sadece SELECT sorgusu olduğunu doğrula"""
+    def _is_write_query(self, sql: str) -> bool:
+        """Sorgunun yazma işlemi olup olmadığını kontrol et"""
+        sql_upper = sql.strip().upper()
+        return any(sql_upper.startswith(kw) for kw in ('INSERT', 'UPDATE', 'DELETE'))
+    
+    def _get_query_type(self, sql: str) -> str:
+        """Sorgunun tipini döndür (SELECT, INSERT, UPDATE, DELETE)"""
+        sql_upper = sql.strip().upper()
+        for kw in ('INSERT', 'UPDATE', 'DELETE', 'SELECT', 'WITH'):
+            if sql_upper.startswith(kw):
+                return kw
+        return "UNKNOWN"
+    
+    def _check_allowed_operations(self, sql: str):
+        """İzin verilen işlem tiplerini kontrol et"""
         parsed = sqlparse.parse(sql)
         
         if not parsed:
             raise ValidationError("Geçersiz SQL sorgusu.")
         
         for statement in parsed:
-            # İlk anlamlı token'ı bul
             first_token = None
             for token in statement.tokens:
                 if not token.is_whitespace:
@@ -118,37 +166,76 @@ class SQLValidator:
             if first_token is None:
                 raise ValidationError("Boş SQL sorgusu.")
             
-            # SELECT veya WITH ile başlamalı (CTE için)
-            if first_token.ttype is Keyword and first_token.value.upper() in ('SELECT', 'WITH'):
+            # İlk keyword'ü bul
+            query_type = self._get_query_type(sql)
+            
+            if query_type == "UNKNOWN":
+                raise ValidationError(
+                    f"Tanınmayan SQL komutu. "
+                    f"İzin verilen komutlar: {', '.join(sorted(self.allowed_operations))}"
+                )
+            
+            # WITH (CTE) her durumda izinliyse SELECT gibi davran
+            if query_type == "WITH":
+                if "SELECT" not in self.allowed_operations:
+                    raise ValidationError("SELECT sorguları izinli değil.")
                 continue
-            elif isinstance(first_token, TokenList):
-                # TokenList içindeki ilk keyword'ü kontrol et
-                found_valid = False
-                for token in first_token.tokens:
-                    if token.ttype is Keyword:
-                        if token.value.upper() in ('SELECT', 'WITH'):
-                            found_valid = True
-                            break
-                        else:
-                            raise ValidationError(
-                                f"Sadece SELECT sorguları izinlidir. "
-                                f"Tespit edilen: {token.value}"
-                            )
-                
-                # Eğer hiç keyword bulunamadıysa da hata verme, devam et
-                if not found_valid:
-                    # Basit bir kontrol: SQL'de SELECT var mı?
-                    if 'SELECT' not in sql.upper():
-                        raise ValidationError(
-                            "Sorgu SELECT veya WITH ile başlamalıdır."
-                        )
-            # Eğer DML keyword ise kontrol et
-            elif first_token.ttype is not None:
-                # Diğer durumlarda basit kontrol
-                if 'SELECT' not in sql.upper() and 'WITH' not in sql.upper():
-                    raise ValidationError(
-                        "Sorgu SELECT veya WITH ile başlamalıdır."
-                    )
+            
+            if query_type not in self.allowed_operations:
+                raise ValidationError(
+                    f"{query_type} komutu izinli değil. "
+                    f"İzin verilen komutlar: {', '.join(sorted(self.allowed_operations))}"
+                )
+    
+    def _check_write_safety(self, sql: str):
+        """
+        Yazma işlemleri için ek güvenlik kontrolleri:
+        - UPDATE/DELETE'de WHERE zorunluluğu
+        - Tablo izin listesi kontrolü
+        """
+        sql_upper = sql.upper().strip()
+        query_type = self._get_query_type(sql)
+        
+        # 1. UPDATE ve DELETE'de WHERE zorunluluğu
+        if query_type in ('UPDATE', 'DELETE'):
+            if 'WHERE' not in sql_upper:
+                raise ValidationError(
+                    f"{query_type} sorgusunda WHERE koşulu zorunludur. "
+                    f"Tüm satırları etkileyen sorgular güvenlik nedeniyle engellenmiştir."
+                )
+        
+        # 2. Tablo izin listesi kontrolü
+        if self.writable_tables is not None:
+            target_table = self._extract_write_target_table(sql, query_type)
+            if target_table and target_table.lower() not in {t.lower() for t in self.writable_tables}:
+                raise ValidationError(
+                    f"'{target_table}' tablosuna yazma izni yok. "
+                    f"İzinli tablolar: {', '.join(sorted(self.writable_tables))}"
+                )
+    
+    def _extract_write_target_table(self, sql: str, query_type: str) -> Optional[str]:
+        """Yazma sorgusundan hedef tablo adını çıkar"""
+        sql_clean = ' '.join(sql.split())  # Fazla boşlukları temizle
+        
+        try:
+            if query_type == 'INSERT':
+                # INSERT INTO table_name ...
+                match = re.search(r'INSERT\s+INTO\s+(\w+)', sql_clean, re.IGNORECASE)
+                return match.group(1) if match else None
+            
+            elif query_type == 'UPDATE':
+                # UPDATE table_name SET ...
+                match = re.search(r'UPDATE\s+(\w+)', sql_clean, re.IGNORECASE)
+                return match.group(1) if match else None
+            
+            elif query_type == 'DELETE':
+                # DELETE FROM table_name ...
+                match = re.search(r'DELETE\s+FROM\s+(\w+)', sql_clean, re.IGNORECASE)
+                return match.group(1) if match else None
+        except Exception:
+            pass
+        
+        return None
     
     def _check_complexity(self, sql: str):
         """Sorgu karmaşıklığını kontrol et"""
@@ -257,4 +344,3 @@ class SQLValidator:
                         tables.append(value)
         
         return tables
-

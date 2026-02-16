@@ -21,7 +21,7 @@ class DatabaseConnection:
             "password": settings.db_password,
         }
         self._connection: Optional[psycopg2.extensions.connection] = None
-        logger.info("DatabaseConnection initialized", params={
+        logger.debug("DatabaseConnection initialized", params={
             "host": settings.db_host,
             "port": settings.db_port,
             "database": settings.db_name,

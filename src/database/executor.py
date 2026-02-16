@@ -28,6 +28,7 @@ class QueryExecutor:
         validator: Optional[SQLValidator] = None,
         timeout: int = None,
         max_rows: int = None,
+        max_write_rows: int = None,
     ):
         """
         Query executor'ı başlat
@@ -36,16 +37,19 @@ class QueryExecutor:
             db_connection: Veritabanı bağlantısı
             validator: SQL validator (None ise yeni oluşturulur)
             timeout: Sorgu zaman aşımı (saniye)
-            max_rows: Maksimum döndürülecek satır sayısı
+            max_rows: Maksimum döndürülecek satır sayısı (SELECT)
+            max_write_rows: Yazma işlemlerinde etkilenecek maksimum satır sayısı
         """
         self.db = db_connection
         self.validator = validator or SQLValidator(strict_mode=True)
         self.timeout = timeout or settings.max_query_timeout
         self.max_rows = max_rows or settings.max_result_rows
-        logger.info(
+        self.max_write_rows = max_write_rows or settings.max_write_rows
+        logger.debug(
             "QueryExecutor initialized",
             timeout=self.timeout,
             max_rows=self.max_rows,
+            max_write_rows=self.max_write_rows,
         )
     
     def execute_query(
@@ -54,7 +58,7 @@ class QueryExecutor:
         validate: bool = True,
     ) -> List[Dict[str, Any]]:
         """
-        SQL sorgusunu güvenli şekilde çalıştır
+        SQL sorgusunu güvenli şekilde çalıştır (SELECT)
         
         Args:
             sql: Çalıştırılacak SQL sorgusu
@@ -93,6 +97,197 @@ class QueryExecutor:
         except Exception as e:
             logger.error("Query execution failed", error=str(e), sql=sql[:200])
             raise QueryExecutionError(f"Sorgu çalıştırma hatası: {str(e)}")
+    
+    def preview_write(
+        self,
+        sql: str,
+        validate: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Yazma sorgusunun dry-run preview'ını döndür (çalıştırmadan).
+        
+        EXPLAIN kullanarak kaç satır etkileneceğini tahmin eder,
+        sorguyu valide eder, ve onay için özet döndürür.
+        
+        Args:
+            sql: INSERT, UPDATE veya DELETE sorgusu
+            validate: True ise önce validasyon yap
+        
+        Returns:
+            Preview bilgisi dictionary'si
+        """
+        preview = {
+            "valid": False,
+            "query_type": None,
+            "sanitized_sql": None,
+            "target_table": None,
+            "estimated_rows": None,
+            "error": None,
+        }
+        
+        # Validasyon
+        if validate:
+            is_valid, error_msg = self.validator.validate(sql)
+            if not is_valid:
+                preview["error"] = error_msg
+                return preview
+        
+        preview["valid"] = True
+        
+        # SQL'i temizle
+        sanitized = self.validator.sanitize_sql(sql)
+        preview["sanitized_sql"] = sanitized
+        
+        # Sorgu tipini belirle
+        query_type = self.validator._get_query_type(sql)
+        preview["query_type"] = query_type
+        
+        # Hedef tabloyu belirle
+        target_table = self.validator._extract_write_target_table(sql, query_type)
+        preview["target_table"] = target_table
+        
+        # EXPLAIN ile etkilenecek satır sayısını tahmin et
+        try:
+            estimated = self._estimate_affected_rows(sanitized)
+            preview["estimated_rows"] = estimated
+            
+            # Satır limiti kontrolü
+            if estimated is not None and estimated > self.max_write_rows:
+                preview["valid"] = False
+                preview["error"] = (
+                    f"Bu sorgu tahminen {estimated} satırı etkileyecek. "
+                    f"Maksimum izin verilen: {self.max_write_rows} satır. "
+                    f"Lütfen WHERE koşulunu daraltın."
+                )
+        except Exception as e:
+            logger.warning("Could not estimate affected rows", error=str(e))
+            preview["estimated_rows"] = None
+        
+        logger.info(
+            "Write preview generated",
+            query_type=query_type,
+            target_table=target_table,
+            estimated_rows=preview["estimated_rows"],
+        )
+        
+        return preview
+    
+    def execute_write(
+        self,
+        sql: str,
+        validate: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Yazma sorgusunu çalıştır (INSERT, UPDATE, DELETE).
+        
+        Önce preview_write() ile onay alındıktan sonra bu metot
+        çağrılmalıdır.
+        
+        Args:
+            sql: INSERT, UPDATE veya DELETE sorgusu
+            validate: True ise önce validasyon yap
+        
+        Returns:
+            Sonuç dictionary'si (affected_rows, query_type, target_table)
+        
+        Raises:
+            ValidationError: Validasyon hatası
+            QueryExecutionError: Sorgu çalıştırma hatası
+        """
+        # Validasyon
+        if validate:
+            is_valid, error_msg = self.validator.validate(sql)
+            if not is_valid:
+                raise ValidationError(error_msg)
+        
+        # SQL'i temizle
+        sanitized = self.validator.sanitize_sql(sql)
+        query_type = self.validator._get_query_type(sql)
+        target_table = self.validator._extract_write_target_table(sql, query_type)
+        
+        # Etkilenecek satır kontrolü (son güvenlik katmanı)
+        estimated = self._estimate_affected_rows(sanitized)
+        if estimated is not None and estimated > self.max_write_rows:
+            raise ValidationError(
+                f"Bu sorgu tahminen {estimated} satırı etkileyecek. "
+                f"Maksimum izin verilen: {self.max_write_rows} satır."
+            )
+        
+        logger.info(
+            "Executing write query",
+            query_type=query_type,
+            target_table=target_table,
+            sql=sanitized[:200],
+        )
+        
+        try:
+            with self.db.get_cursor() as cursor:
+                # Timeout ayarla
+                cursor.execute(f"SET statement_timeout = {self.timeout * 1000};")
+                
+                # Sorguyu çalıştır
+                cursor.execute(sanitized)
+                affected_rows = cursor.rowcount
+            
+            result = {
+                "success": True,
+                "affected_rows": affected_rows,
+                "query_type": query_type,
+                "target_table": target_table,
+            }
+            
+            logger.info(
+                "Write query executed successfully",
+                affected_rows=affected_rows,
+                query_type=query_type,
+                target_table=target_table,
+            )
+            
+            return result
+            
+        except Exception as e:
+            error_msg = str(e).lower()
+            
+            if 'timeout' in error_msg or 'canceling statement' in error_msg:
+                raise TimeoutError(
+                    f"Sorgu {self.timeout} saniye içinde tamamlanamadı."
+                )
+            
+            logger.error("Write query failed", error=str(e), sql=sanitized[:200])
+            raise QueryExecutionError(f"Yazma sorgusu hatası: {str(e)}")
+    
+    def _estimate_affected_rows(self, sql: str) -> Optional[int]:
+        """
+        EXPLAIN kullanarak etkilenecek satır sayısını tahmin et.
+        
+        Args:
+            sql: SQL sorgusu
+        
+        Returns:
+            Tahmini etkilenecek satır sayısı (None ise tahmin yapılamadı)
+        """
+        try:
+            explain_sql = f"EXPLAIN (FORMAT JSON) {sql}"
+            
+            with self.db.get_cursor() as cursor:
+                cursor.execute(explain_sql)
+                result = cursor.fetchone()
+                
+                if result:
+                    # EXPLAIN JSON çıktısından Plan Rows'u al
+                    plan_data = result.get('QUERY PLAN', result) if isinstance(result, dict) else result
+                    if isinstance(plan_data, list) and len(plan_data) > 0:
+                        plan = plan_data[0].get('Plan', {})
+                        return plan.get('Plan Rows', None)
+                    elif isinstance(plan_data, dict):
+                        plan = plan_data.get('Plan', {})
+                        return plan.get('Plan Rows', None)
+            
+            return None
+            
+        except Exception as e:
+            logger.warning("Failed to estimate affected rows", error=str(e))
+            return None
     
     def _ensure_limit(self, sql: str) -> str:
         """
@@ -271,4 +466,3 @@ class QueryExecutor:
         except Exception as e:
             logger.error("Failed to get query stats", error=str(e))
             return {"error": str(e)}
-

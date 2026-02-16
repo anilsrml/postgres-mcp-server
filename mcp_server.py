@@ -17,10 +17,15 @@ KURULUM VE KULLANIM:
    DB_USER=your_username
    DB_PASSWORD=your_password
 
-3. MCP sunucusunu test edin:
-   python src/mcp_server.py
+3. Yazma işlemlerini etkinleştirmek için:
+   WRITE_ENABLED=true
+   WRITABLE_TABLES=customers,orders,products
+   MAX_WRITE_ROWS=100
 
-4. Claude Desktop için yapılandırma:
+4. MCP sunucusunu test edin:
+   python mcp_server.py
+
+5. Claude Desktop için yapılandırma:
    
    Windows: %APPDATA%/Claude/claude_desktop_config.json
    Mac: ~/Library/Application Support/Claude/claude_desktop_config.json
@@ -31,31 +36,38 @@ KURULUM VE KULLANIM:
      "mcpServers": {
        "postgres-dbq": {
          "command": "python",
-         "args": ["c:/Users/anil6/Desktop/dbq-copy/src/mcp_server.py"],
+         "args": ["c:/Users/anil6/Desktop/dbqa-w-mcp/mcp_server.py"],
          "env": {}
        }
      }
    }
 
-5. Cursor IDE için yapılandırma:
+6. Cursor IDE için yapılandırma:
    
    Settings (Ctrl+,) -> MCP -> Add Server
    
    Name: postgres-dbq
    Command: python
-   Args: ["c:/Users/anil6/Desktop/dbq-copy/src/mcp_server.py"]
+   Args: ["c:/Users/anil6/Desktop/dbqa-w-mcp/mcp_server.py"]
 
 GÜVENLİK:
 =========
-- Sadece SELECT sorguları çalıştırılabilir
-- INSERT, UPDATE, DELETE, DROP gibi komutlar engellenmiştir
-- Mevcut SQLValidator sınıfı kullanılarak tüm sorgular doğrulanır
-- Sorgu sonuçları maksimum 1000 satır ile sınırlandırılmıştır
+- DDL komutları (DROP, TRUNCATE, ALTER, CREATE) her zaman engellenmiştir
+- SELECT sorguları her zaman çalıştırılabilir (query_database tool'u)
+- Yazma işlemleri (INSERT, UPDATE, DELETE) iki aşamalı onay mekanizması ile çalışır:
+  1. modify_data → Dry-run preview (kaç satır etkileneceğini gösterir)
+  2. confirm_modification → Gerçek çalıştırma (onay sonrası)
+- UPDATE/DELETE sorgularında WHERE koşulu zorunludur
+- Tek sorguda etkilenecek satır sayısı sınırlandırılmıştır (varsayılan: 100)
+- Sadece .env'de belirtilen tablolara yazma izni verilir
+- WRITE_ENABLED=false ise yazma tool'ları tamamen devre dışıdır
 
 ÖZELLİKLER:
 ===========
 Resource: postgres://schema - Veritabanı şeması bilgisi
-Tool: query_database - Güvenli SQL sorgu çalıştırma
+Tool: query_database - Güvenli SQL sorgu çalıştırma (SELECT)
+Tool: modify_data - Yazma sorgusu preview (INSERT/UPDATE/DELETE) [opsiyonel]
+Tool: confirm_modification - Onaylanan yazma sorgusunu çalıştırma [opsiyonel]
 """
 
 import asyncio
@@ -86,6 +98,7 @@ mcp = FastMCP("PostgreSQL Database MCP Server")
 db_connection: DatabaseConnection = None
 schema_manager: SchemaManager = None
 query_executor: QueryExecutor = None
+write_executor: QueryExecutor = None  # Yazma işlemleri için ayrı executor
 
 
 @mcp.resource("postgres://schema")
@@ -180,6 +193,156 @@ async def query_database(sql_query: str) -> str:
         return f"❌ {error_msg}\n\n💡 İpucu: Lütfen sorgu formatınızı kontrol edin."
 
 
+# ============================================================
+# YAZMA İŞLEMLERİ (WRITE_ENABLED=true ise aktif)
+# ============================================================
+
+def register_write_tools():
+    """
+    Yazma tool'larını MCP sunucusuna kaydet.
+    Sadece WRITE_ENABLED=true ise çağrılır.
+    """
+    
+    @mcp.tool()
+    async def modify_data(sql_query: str) -> str:
+        """
+        Yazma sorgusu preview'ı: Sorguyu doğrular ve kaç satır etkileneceğini gösterir.
+        
+        Bu tool sorguyu ÇALIŞTIRMAZ, sadece preview döndürür.
+        Sorguyu gerçekten çalıştırmak için confirm_modification tool'unu kullanın.
+        
+        Güvenlik kuralları:
+        - Sadece INSERT, UPDATE, DELETE komutları çalıştırılabilir
+        - UPDATE ve DELETE sorgularında WHERE koşulu zorunludur
+        - Tek sorguda etkilenecek satır sayısı sınırlıdır
+        - Sadece izinli tablolara yazma yapılabilir
+        - DDL komutları (DROP, CREATE, ALTER vb.) her zaman engellenir
+        
+        Args:
+            sql_query: INSERT, UPDATE veya DELETE sorgusu
+            
+        Returns:
+            Preview bilgisi (etkilenecek satır sayısı, hedef tablo, doğrulama durumu)
+            
+        Examples:
+            modify_data("INSERT INTO customers (name, email) VALUES ('Ahmet', 'ahmet@example.com')")
+            modify_data("UPDATE orders SET status = 'shipped' WHERE id = 42")
+            modify_data("DELETE FROM logs WHERE created_at < '2024-01-01'")
+        """
+        try:
+            logger.info("MCP Tool called: modify_data (preview)", sql=sql_query[:200])
+            
+            # Dry-run preview oluştur
+            preview = write_executor.preview_write(
+                sql=sql_query,
+                validate=True,
+            )
+            
+            if not preview["valid"]:
+                error_msg = preview.get("error", "Bilinmeyen doğrulama hatası")
+                logger.warning("Write preview validation failed", error=error_msg)
+                return (
+                    f"❌ Sorgu Doğrulama Hatası: {error_msg}\n\n"
+                    f"💡 İpucu:\n"
+                    f"  - UPDATE/DELETE sorgularında WHERE koşulu zorunludur\n"
+                    f"  - Sadece izinli tablolara yazma yapılabilir\n"
+                    f"  - DDL komutları (DROP, ALTER vb.) engellenmiştir"
+                )
+            
+            # Preview başarılı - sonucu formatla
+            preview_text = (
+                f"📋 **Yazma İşlemi Preview**\n"
+                f"{'=' * 40}\n"
+                f"📌 Sorgu Tipi: {preview['query_type']}\n"
+                f"📌 Hedef Tablo: {preview['target_table'] or 'Belirlenemedi'}\n"
+                f"📌 Tahmini Etkilenen Satır: {preview['estimated_rows'] if preview['estimated_rows'] is not None else 'Hesaplanamadı'}\n"
+                f"📌 Temizlenmiş SQL:\n```sql\n{preview['sanitized_sql']}\n```\n\n"
+                f"⚠️ Bu sorgu henüz ÇALIŞTIRILMADI.\n"
+                f"✅ Çalıştırmak için confirm_modification tool'unu aynı SQL ile çağırın."
+            )
+            
+            logger.info(
+                "Write preview generated successfully",
+                query_type=preview["query_type"],
+                target_table=preview["target_table"],
+                estimated_rows=preview["estimated_rows"],
+            )
+            
+            return preview_text
+            
+        except Exception as e:
+            error_msg = f"Beklenmeyen Hata: {str(e)}"
+            logger.error("Unexpected error in modify_data", error=str(e))
+            return f"❌ {error_msg}"
+    
+    @mcp.tool()
+    async def confirm_modification(sql_query: str) -> str:
+        """
+        Onaylanan yazma sorgusunu gerçekten çalıştırır.
+        
+        ÖNEMLİ: Bu tool'u çağırmadan önce mutlaka modify_data tool'u ile
+        preview alınmış olmalıdır. Bu tool sorguyu doğrular ve çalıştırır.
+        
+        Args:
+            sql_query: Daha önce modify_data ile preview alınan SQL sorgusu
+            
+        Returns:
+            İşlem sonucu (etkilenen satır sayısı, hedef tablo)
+        """
+        try:
+            logger.info("MCP Tool called: confirm_modification", sql=sql_query[:200])
+            
+            # Sorguyu çalıştır
+            result = write_executor.execute_write(
+                sql=sql_query,
+                validate=True,
+            )
+            
+            if result["success"]:
+                success_text = (
+                    f"✅ **Yazma İşlemi Başarılı**\n"
+                    f"{'=' * 40}\n"
+                    f"📌 Sorgu Tipi: {result['query_type']}\n"
+                    f"📌 Hedef Tablo: {result['target_table'] or 'Belirlenemedi'}\n"
+                    f"📌 Etkilenen Satır Sayısı: {result['affected_rows']}\n"
+                )
+                
+                logger.info(
+                    "Write query confirmed and executed",
+                    query_type=result["query_type"],
+                    target_table=result["target_table"],
+                    affected_rows=result["affected_rows"],
+                )
+                
+                return success_text
+            
+        except ValidationError as e:
+            error_msg = f"Validasyon Hatası: {str(e)}"
+            logger.warning("Write confirmation validation failed", error=str(e))
+            return (
+                f"❌ {error_msg}\n\n"
+                f"💡 İpucu: Önce modify_data tool'u ile preview alın."
+            )
+            
+        except QueryExecutionError as e:
+            error_msg = f"Sorgu Hatası: {str(e)}"
+            logger.error("Write confirmation execution failed", error=str(e))
+            return (
+                f"❌ {error_msg}\n\n"
+                f"💡 İpucu: SQL syntax'ını kontrol edin."
+            )
+            
+        except QueryTimeoutError as e:
+            error_msg = f"Zaman Aşımı: {str(e)}"
+            logger.error("Write confirmation timeout", error=str(e))
+            return f"❌ {error_msg}"
+            
+        except Exception as e:
+            error_msg = f"Beklenmeyen Hata: {str(e)}"
+            logger.error("Unexpected error in confirm_modification", error=str(e))
+            return f"❌ {error_msg}"
+
+
 def initialize_database():
     """
     Veritabanı bağlantısını ve yöneticilerini başlat.
@@ -187,10 +350,10 @@ def initialize_database():
     Mevcut DatabaseConnection, SchemaManager ve QueryExecutor
     sınıflarını kullanır (DRY prensibi).
     """
-    global db_connection, schema_manager, query_executor
+    global db_connection, schema_manager, query_executor, write_executor
     
     try:
-        logger.info(
+        logger.debug(
             "Initializing database connection",
             host=settings.db_host,
             port=settings.db_port,
@@ -207,14 +370,36 @@ def initialize_database():
         # Mevcut SchemaManager'ı başlat
         schema_manager = SchemaManager(db_connection)
         
-        # Mevcut QueryExecutor'ı başlat (güvenlik validasyonları ile)
-        validator = SQLValidator(strict_mode=True)  # Katı mod: sadece SELECT
+        # ===== OKUMA (SELECT) EXECUTOR =====
+        read_validator = SQLValidator(strict_mode=True)  # Varsayılan: sadece SELECT
         query_executor = QueryExecutor(
             db_connection=db_connection,
-            validator=validator,
+            validator=read_validator,
             timeout=settings.max_query_timeout,
-            max_rows=settings.max_result_rows
+            max_rows=settings.max_result_rows,
         )
+        
+        # ===== YAZMA EXECUTOR (opsiyonel) =====
+        if settings.write_enabled:
+            writable_tables = settings.writable_tables_set or None  # Boş set → None (tüm tablolar)
+            
+            write_validator = SQLValidator(
+                strict_mode=True,
+                allowed_operations={"INSERT", "UPDATE", "DELETE"},
+                writable_tables=writable_tables,
+            )
+            write_executor = QueryExecutor(
+                db_connection=db_connection,
+                validator=write_validator,
+                timeout=settings.max_query_timeout,
+                max_write_rows=settings.max_write_rows,
+            )
+            
+            logger.debug(
+                "Write executor initialized",
+                writable_tables=list(writable_tables) if writable_tables else "ALL",
+                max_write_rows=settings.max_write_rows,
+            )
         
         logger.info("Database initialized successfully")
         
@@ -235,11 +420,24 @@ if __name__ == "__main__":
         logger.info("Starting MCP server...")
         initialize_database()
         
+        # Yazma tool'larını kaydet (eğer etkinse)
+        tools_list = ["query_database"]
+        if settings.write_enabled:
+            register_write_tools()
+            tools_list.extend(["modify_data", "confirm_modification"])
+            logger.info(
+                "Write tools registered",
+                writable_tables=settings.writable_tables or "ALL",
+                max_write_rows=settings.max_write_rows,
+            )
+        else:
+            logger.info("Write tools DISABLED (WRITE_ENABLED=false)")
+        
         # MCP sunucusunu başlat
         logger.info(
             "MCP server ready",
             resources=["postgres://schema"],
-            tools=["query_database"]
+            tools=tools_list,
         )
         
         # Sunucuyu çalıştır

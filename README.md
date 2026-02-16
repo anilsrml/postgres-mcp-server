@@ -93,7 +93,7 @@ Add the following information to your AI assistant's configuration file (e.g., `
     *   `rules.py`: Forbidden keywords and limit definitions.
     *   `src/config.py`: Pydantic-based configuration management.
 
-## ⚠️ Security Warning
+##  Security Warning
 
 This tool possesses powerful capabilities. When `WRITE_ENABLED=true` is set, your AI model can make changes to the database.
 *   **Configure `WRITABLE_TABLES`** strictly before using in a Live (Production) environment.

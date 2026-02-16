@@ -37,6 +37,18 @@ class Settings(BaseSettings):
     max_query_timeout: int = Field(default=30, alias="MAX_QUERY_TIMEOUT")
     max_result_rows: int = Field(default=1000, alias="MAX_RESULT_ROWS")
     
+    # Yazma İşlemleri Güvenlik Ayarları
+    write_enabled: bool = Field(default=False, alias="WRITE_ENABLED")
+    writable_tables: str = Field(default="", alias="WRITABLE_TABLES")  # virgülle ayrılmış tablo isimleri
+    max_write_rows: int = Field(default=100, alias="MAX_WRITE_ROWS")
+    
+    @property
+    def writable_tables_set(self) -> set:
+        """Yazma izni verilen tablo isimlerini set olarak döndür"""
+        if not self.writable_tables.strip():
+            return set()
+        return {t.strip() for t in self.writable_tables.split(",") if t.strip()}
+    
     # Loglama
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
     
