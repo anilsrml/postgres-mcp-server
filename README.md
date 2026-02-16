@@ -4,7 +4,7 @@ This project acts as a secure bridge connecting your **PostgreSQL** database to 
 
 By leveraging the **Model Context Protocol (MCP)**, it enables AI models to understand your database schema, securely query it (SELECT), and perform controlled data modifications (INSERT, UPDATE, DELETE).
 
-## 🚀 Features
+##  Features
 
 *   **Schema Analysis:** Automatically introduces database tables, columns, and relationships to the AI.
 *   **Natural Language Querying:** AI translates natural language questions into SQL and retrieves results.
@@ -13,7 +13,7 @@ By leveraging the **Model Context Protocol (MCP)**, it enables AI models to unde
     *   **Two-Phase Approval:** AI first previews the affected rows using `modify_data`, then confirms the modification with `confirm_modification`.
     *   **Kill Switch:** Write permissions can be instantly disabled with `WRITE_ENABLED=false`.
 
-## 🛡️ 7-Layer Security Model
+##  7-Layer Security Model
 
 This server employs a multi-layered protection system to ensure data safety:
 
@@ -25,7 +25,7 @@ This server employs a multi-layered protection system to ensure data safety:
 6.  **Separate Isolation:** Distinct connection managers and validators are used for read and write operations.
 7.  **Audit Log:** All operations are logged in detail.
 
-## 🛠️ Installation
+##  Installation
 
 1.  Install the necessary dependencies:
     ```bash
@@ -47,7 +47,7 @@ This server employs a multi-layered protection system to ensure data safety:
     MAX_WRITE_ROWS=100                         # Max 100 rows can be changed at once
     ```
 
-## 💻 Usage
+##  Usage
 
 To start the MCP server:
 
@@ -55,7 +55,7 @@ To start the MCP server:
 python mcp_server.py
 ```
 
-### 🤖 AI Client Configuration (Claude Desktop / Cursor)
+###  AI Client Configuration (Claude Desktop / Cursor)
 
 Add the following information to your AI assistant's configuration file (e.g., `claude_desktop_config.json` or Cursor settings). It is recommended to specify `.env` variables within the `env` block:
 
@@ -82,7 +82,7 @@ Add the following information to your AI assistant's configuration file (e.g., `
 
 > **Note:** On Windows, be careful to use `\\` or `/` in file paths. You may need to specify the full Python environment path (e.g., `c:/Users/.../venv/Scripts/python.exe`).
 
-## 📂 Project Structure
+##  Project Structure
 
 *   `mcp_server.py`: Main MCP server file. Tool definitions are located here.
 *   `src/database/`: 
