@@ -1,5 +1,6 @@
 """Konfigürasyon yönetimi"""
 
+from urllib.parse import urlparse
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
 from typing import Optional
@@ -26,12 +27,9 @@ class Settings(BaseSettings):
     # Google Gemini API (opsiyonel)
     google_api_key: Optional[str] = Field(default=None, alias="GOOGLE_API_KEY")
     
-    # PostgreSQL Bağlantı Bilgileri
-    db_host: str = Field(default="localhost", alias="DB_HOST")
-    db_port: int = Field(default=5432, alias="DB_PORT")
-    db_name: str = Field(..., alias="DB_NAME")
-    db_user: str = Field(..., alias="DB_USER")
-    db_password: str = Field(..., alias="DB_PASSWORD")
+    # PostgreSQL Bağlantı URI (tek satır)
+    # Format: postgresql://username:password@host:port/dbname
+    database_uri: str = Field(..., alias="DATABASE_URI")
     
     # Güvenlik Ayarları
     max_query_timeout: int = Field(default=30, alias="MAX_QUERY_TIMEOUT")
@@ -54,10 +52,41 @@ class Settings(BaseSettings):
     
     @property
     def database_url(self) -> str:
-        """PostgreSQL bağlantı URL'i"""
-        return f"postgresql://{self.db_user}:{self.db_password}@{self.db_host}:{self.db_port}/{self.db_name}"
+        """PostgreSQL bağlantı URL'i (DATABASE_URI'yi döndürür)"""
+        return self.database_uri
+    
+    # --- URI'den parse edilen yardımcı property'ler (loglama için) ---
+    
+    @property
+    def _parsed_uri(self):
+        return urlparse(self.database_uri)
+    
+    @property
+    def db_host(self) -> str:
+        return self._parsed_uri.hostname or "localhost"
+    
+    @property
+    def db_port(self) -> int:
+        return self._parsed_uri.port or 5432
+    
+    @property
+    def db_name(self) -> str:
+        return self._parsed_uri.path.lstrip("/")
+    
+    @property
+    def db_user(self) -> str:
+        return self._parsed_uri.username or ""
+    
+    @property
+    def masked_uri(self) -> str:
+        """Şifre maskelenmiş URI (loglama için güvenli)"""
+        parsed = self._parsed_uri
+        if parsed.password:
+            return self.database_uri.replace(f":{parsed.password}@", ":****@")
+        return self.database_uri
 
 
 # Global settings instance
 settings = Settings()
+
 

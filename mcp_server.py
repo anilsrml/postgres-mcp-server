@@ -7,48 +7,36 @@ güvenli bir şekilde etkileşim kurmasını sağlar.
 KURULUM VE KULLANIM:
 ====================
 
-1. Bağımlılıkları yükleyin:
-   pip install -r requirements.txt
+1. Docker image oluşturun:
+   docker build -t postgres-mcp-server .
 
-2. .env dosyasında veritabanı bağlantı bilgilerinizi ayarlayın:
-   DB_HOST=localhost
-   DB_PORT=5432
-   DB_NAME=your_database
-   DB_USER=your_username
-   DB_PASSWORD=your_password
+2. .env dosyasında veritabanı bağlantı URI'nizi ayarlayın:
+   DATABASE_URI=postgresql://username:password@localhost:5432/dbname
 
 3. Yazma işlemlerini etkinleştirmek için:
    WRITE_ENABLED=true
    WRITABLE_TABLES=customers,orders,products
    MAX_WRITE_ROWS=100
 
-4. MCP sunucusunu test edin:
-   python mcp_server.py
-
-5. Claude Desktop için yapılandırma:
-   
-   Windows: %APPDATA%/Claude/claude_desktop_config.json
-   Mac: ~/Library/Application Support/Claude/claude_desktop_config.json
-   
-   Şu içeriği ekleyin:
+4. Claude Desktop / Cursor için yapılandırma:
    
    {
      "mcpServers": {
        "postgres-dbq": {
-         "command": "python",
-         "args": ["c:/Users/anil6/Desktop/dbqa-w-mcp/mcp_server.py"],
-         "env": {}
+         "command": "docker",
+         "args": ["run", "-i", "--rm", "--network", "host",
+                  "-e", "DATABASE_URI", "-e", "WRITE_ENABLED",
+                  "-e", "WRITABLE_TABLES", "-e", "MAX_WRITE_ROWS",
+                  "postgres-mcp-server"],
+         "env": {
+           "DATABASE_URI": "postgresql://username:password@localhost:5432/dbname",
+           "WRITE_ENABLED": "true",
+           "WRITABLE_TABLES": "",
+           "MAX_WRITE_ROWS": "100"
+         }
        }
      }
    }
-
-6. Cursor IDE için yapılandırma:
-   
-   Settings (Ctrl+,) -> MCP -> Add Server
-   
-   Name: postgres-dbq
-   Command: python
-   Args: ["c:/Users/anil6/Desktop/dbqa-w-mcp/mcp_server.py"]
 
 GÜVENLİK:
 =========
@@ -355,9 +343,7 @@ def initialize_database():
     try:
         logger.debug(
             "Initializing database connection",
-            host=settings.db_host,
-            port=settings.db_port,
-            database=settings.db_name
+            dsn=settings.masked_uri,
         )
         
         # Mevcut DatabaseConnection sınıfını kullan

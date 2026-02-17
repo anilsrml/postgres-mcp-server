@@ -13,19 +13,9 @@ class DatabaseConnection:
     
     def __init__(self):
         """Bağlantı parametrelerini ayarla"""
-        self.connection_params = {
-            "host": settings.db_host,
-            "port": settings.db_port,
-            "database": settings.db_name,
-            "user": settings.db_user,
-            "password": settings.db_password,
-        }
+        self.dsn = settings.database_uri
         self._connection: Optional[psycopg2.extensions.connection] = None
-        logger.debug("DatabaseConnection initialized", params={
-            "host": settings.db_host,
-            "port": settings.db_port,
-            "database": settings.db_name,
-        })
+        logger.debug("DatabaseConnection initialized", dsn=settings.masked_uri)
     
     def connect(self) -> psycopg2.extensions.connection:
         """
@@ -39,7 +29,7 @@ class DatabaseConnection:
         """
         try:
             if self._connection is None or self._connection.closed:
-                self._connection = psycopg2.connect(**self.connection_params)
+                self._connection = psycopg2.connect(self.dsn)
                 logger.info("Database connection established")
             return self._connection
         except psycopg2.Error as e:

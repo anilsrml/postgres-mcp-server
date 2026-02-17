@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+.git/
+.gitignore
+venv/
+.cursor/
+.gemini/
+terminals/
+.DS_Store
+*.md
+!requirements.txt

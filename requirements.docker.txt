@@ -1,0 +1,18 @@
+# MCP Server için minimal bağımlılıklar
+
+# Veritabanı
+psycopg2-binary==2.9.9
+
+# SQL Parsing ve Validasyon
+sqlparse==0.4.4
+
+# Konfigürasyon
+python-dotenv==1.0.0
+pydantic==2.9.2
+pydantic-settings==2.6.1
+
+# Loglama
+structlog==24.1.0
+
+# MCP Server Framework
+fastmcp>=2.0.0
